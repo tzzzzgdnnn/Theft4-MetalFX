@@ -55,45 +55,83 @@ double ReadScale(CFStringRef percent_key, CFStringRef legacy_key) {
     return 0.6;
 }
 
-struct Slot { uint32_t address; uint32_t written = 0; bool have = false; };
+// Each slot remembers the game's own request (the value it last stored) and
+// what we wrote, so the scale can change at runtime (governor / benchmark)
+// and stock (100%) restores the game's value exactly.
+struct Slot { uint32_t address; uint32_t written = 0; float requested = 0; bool have = false; };
 Slot slots[] = {{kRandomCarDensity}, {kParkedCarDensity}, {kPedDensity},
                 {kScenarioPedCurrent}, {kScenarioPedNext}};
-std::atomic<int> state{0};  // 0 unknown, 1 ready, -1 disabled
+std::atomic<int> state{0};  // 0 unknown, 1 ready, -1 unreadable
+// Runtime scales in per-mille; generation bumps on every change.
+std::atomic<int> traffic_pm{-1}, ped_pm{-1};
+std::atomic<uint32_t> generation{1};
+uint32_t applied_generation = 0;  // game thread only
 double traffic_scale = 1.0, ped_scale = 1.0;
 
 void Apply(uint8_t* base) {
     int st = state.load(std::memory_order_relaxed);
     if (st < 0) return;
     if (st == 0) {
-        traffic_scale = ReadScale(CFSTR("Theft4TrafficDensityPct"), CFSTR("Theft4TrafficDensity"));
-        ped_scale = ReadScale(CFSTR("Theft4PedDensityPct"), CFSTR("Theft4PedDensity"));
+        if (traffic_pm.load(std::memory_order_relaxed) < 0) {
+            traffic_pm.store(int(ReadScale(CFSTR("Theft4TrafficDensityPct"), CFSTR("Theft4TrafficDensity")) * 1000 + 0.5));
+            ped_pm.store(int(ReadScale(CFSTR("Theft4PedDensityPct"), CFSTR("Theft4PedDensity")) * 1000 + 0.5));
+        }
         const bool ok = Readable(base, kRandomCarDensity, 8) && Readable(base, kPedDensity, 12);
-        const bool stock = traffic_scale == 1.0 && ped_scale == 1.0;
-        state.store(ok && !stock ? 1 : -1, std::memory_order_relaxed);
-        if (!ok || stock) return;
+        state.store(ok ? 1 : -1, std::memory_order_relaxed);
+        if (!ok) return;
+    }
+    const uint32_t gen = generation.load(std::memory_order_acquire);
+    const bool rescale = gen != applied_generation;
+    if (rescale) {
+        applied_generation = gen;
+        traffic_scale = traffic_pm.load(std::memory_order_relaxed) / 1000.0;
+        ped_scale = ped_pm.load(std::memory_order_relaxed) / 1000.0;
+    }
+    // Stock everywhere and nothing of ours left in memory: nothing to do.
+    if (traffic_scale == 1.0 && ped_scale == 1.0 && !rescale) {
+        bool any = false;
+        for (const Slot& s : slots) any = any || s.have;
+        if (!any) return;
     }
     for (int i = 0; i < 5; ++i) {
         Slot& s = slots[i];
         const double scale = i < 2 ? traffic_scale : ped_scale;
         const uint32_t raw = REX_LOAD_U32(s.address);
-        if (s.have && raw == s.written) continue;
-        const float requested = std::bit_cast<float>(raw);
-        if (!std::isfinite(requested) || requested <= 0.0f) { s.have = false; continue; }
-        const float scaled = static_cast<float>(requested * scale);
+        if (s.have && raw == s.written) {
+            if (!rescale) continue;
+            // Our value is still in place: rescale the remembered request.
+        } else {
+            const float requested = std::bit_cast<float>(raw);
+            if (!std::isfinite(requested) || requested <= 0.0f) { s.have = false; continue; }
+            s.requested = requested;
+        }
+        const float scaled = static_cast<float>(s.requested * scale);
         const uint32_t out = std::bit_cast<uint32_t>(scaled);
-        REX_STORE_U32(s.address, out);
+        if (out != raw) REX_STORE_U32(s.address, out);
         s.written = out;
-        s.have = true;
+        s.have = scale != 1.0;  // at 100% the game's own value is back in place
     }
 }
 }  // namespace citydensity
 
+// Runtime density (percent of the game's own request, 1..100). Takes effect
+// at the next population update; existing cars/peds are not deleted, the
+// spawners simply create fewer (or more) from then on.
+extern "C" void theft4_city_density_set(int traffic_percent, int ped_percent) {
+    auto clamp = [](int v) { return v < 1 ? 1 : v > 100 ? 100 : v; };
+    citydensity::traffic_pm.store(clamp(traffic_percent) * 10, std::memory_order_relaxed);
+    citydensity::ped_pm.store(clamp(ped_percent) * 10, std::memory_order_relaxed);
+    citydensity::generation.fetch_add(1, std::memory_order_release);
+}
+
 // Read-only snapshot for Long Performance Capture: configured scales, state
-// (0 not yet applied, 1 active, -1 disabled/stock) and the last value seen in
+// (0 not yet applied, 1 active, -1 unreadable) and the last value written in
 // each guest multiplier (random cars, parked cars, peds, scenario cur/next).
 extern "C" int theft4_city_density_snapshot(double* traffic, double* peds, float* values5) {
-    if (traffic) *traffic = citydensity::traffic_scale;
-    if (peds) *peds = citydensity::ped_scale;
+    const int tp = citydensity::traffic_pm.load(std::memory_order_relaxed);
+    const int pp = citydensity::ped_pm.load(std::memory_order_relaxed);
+    if (traffic) *traffic = tp >= 0 ? tp / 1000.0 : citydensity::traffic_scale;
+    if (peds) *peds = pp >= 0 ? pp / 1000.0 : citydensity::ped_scale;
     const int st = citydensity::state.load(std::memory_order_relaxed);
     if (values5) {
         for (int i = 0; i < 5; ++i)

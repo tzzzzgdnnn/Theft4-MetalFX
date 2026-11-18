@@ -122,7 +122,7 @@ class Backend final:public render::FrameBackend {
            plan->output->level || plan->output->slice || plan->output->aspect!=render::Aspect::Color) {
           error="Frame output does not match the current Metal drawable";return false;
         }
-        if(fi::Active(device_,target.width,target.height)) {
+        if(fi::Wanted()&&fi::Prepare(device_,target.width,target.height)) {
           // MetalFX frame interpolation: render the frame offscreen, then the
           // interpolation path presents interpolated + real drawables.
           fi::MarkPresentedFrame(true);
@@ -134,8 +134,19 @@ class Backend final:public render::FrameBackend {
             auto color=adapter_->Output(*plan,present_error);
             const uint64_t drawable_begin_ns=perf?theft4_perf_now_ns():0;
             if(!color||!fi::Present(renderer_->Queue(),layer_,color,commit_ns,present_error)) {
+              // Never leave the frame unpresented: fall back to a plain copy.
               static int reported=0;
-              if(reported++<8)std::fprintf(stderr,"theft4-fi: present failed: %s\n",present_error.c_str());
+              if(reported++<8)std::fprintf(stderr,"theft4-fg: present failed: %s\n",present_error.c_str());
+              if(color) {
+                id<CAMetalDrawable> fallback=[layer_ nextDrawable];
+                id<MTLCommandBuffer> blit=fallback?[renderer_->Queue() commandBuffer]:nil;
+                if(blit&&fallback.texture.width==color.width&&fallback.texture.height==color.height&&
+                   fallback.texture.pixelFormat==color.pixelFormat) {
+                  id<MTLBlitCommandEncoder> b=[blit blitCommandEncoder];
+                  [b copyFromTexture:color toTexture:fallback.texture];[b endEncoding];
+                  [blit presentDrawable:fallback];[blit commit];
+                }
+              }
             }
             if(perf)drawable_wait_ns=theft4_perf_now_ns()-drawable_begin_ns;
           }

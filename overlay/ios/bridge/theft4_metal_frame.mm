@@ -570,20 +570,21 @@ template<bool Diagnostics> Receipt FrameAdapter::SubmitFrameImpl(const std::shar
   // Theft4-MetalFX frame interpolation: pick the scene pass (most game draws
   // with a single-sample depth attachment); its depth is kept and turned into
   // interpolator depth + camera motion vectors right after the pass.
+  // Multisampled scene depth is accepted (read at sample 0); build 5 only took
+  // single-sample depth, which left frame generation without inputs.
+  // Off: one relaxed atomic load, no scan, no forced depth store.
   size_t fi_pass=size_t(-1);
-  if(fi::PresentedFrameMarked()&&plan->output) {
-    const auto* out=render::FindSurface(*plan,plan->output->surface);
-    if(out&&fi::Active(impl_->renderer.Device(),out->width,out->height)) {
-      size_t best=0,index=0;
-      for(const auto& command:plan->commands) {
-        const auto here=index++;
-        const auto* pass=std::get_if<render::Pass>(&command);if(!pass||!pass->depth)continue;
-        const auto* depth_surface=render::FindSurface(*plan,pass->depth->view.surface);
-        if(!depth_surface||depth_surface->samples!=1||depth_surface->kind!=render::ImageKind::Texture2D)continue;
-        size_t draws=0;for(const auto& c:pass->commands)if(std::holds_alternative<render::FrameDraw>(c))++draws;
-        if(draws>best){best=draws;fi_pass=here;}
-      }
+  if(fi::PresentedFrameMarked()&&fi::Wanted()&&plan->output) {
+    size_t best=0,index=0;
+    for(const auto& command:plan->commands) {
+      const auto here=index++;
+      const auto* pass=std::get_if<render::Pass>(&command);if(!pass||!pass->depth)continue;
+      const auto* depth_surface=render::FindSurface(*plan,pass->depth->view.surface);
+      if(!depth_surface||depth_surface->kind!=render::ImageKind::Texture2D)continue;
+      size_t draws=0;for(const auto& c:pass->commands)if(std::holds_alternative<render::FrameDraw>(c))++draws;
+      if(draws>best){best=draws;fi_pass=here;}
     }
+    if(fi_pass==size_t(-1))fi::NoteNoDepth(THEFT4_FG_NO_DEPTH);
   }
   const auto prepared_at=clock_now();
   size_t preparation_errors=0;std::string first_preparation_error;
@@ -632,7 +633,7 @@ template<bool Diagnostics> Receipt FrameAdapter::SubmitFrameImpl(const std::shar
     const bool metalfx=upscaled||enhanced;
     auto descriptor=impl_->Pass(pass,error);if(!descriptor)return {};
     for(size_t slot=0;slot<4;++slot)if(dead&(1u<<slot)){descriptor.colorAttachments[slot].storeAction=MTLStoreActionDontCare;if constexpr(Diagnostics)++avoided_stores;}
-    const bool fi_scene_pass=command_index-1==fi_pass;
+    const bool fi_scene_pass=fi_pass!=size_t(-1)&&command_index-1==fi_pass&&pass.depth;
     if((dead&16u)&&!fi_scene_pass){descriptor.depthAttachment.storeAction=MTLStoreActionDontCare;if constexpr(Diagnostics)++avoided_stores;}
     // Frame interpolation samples this depth after the pass: it must be stored.
     if(fi_scene_pass&&descriptor.depthAttachment.texture)descriptor.depthAttachment.storeAction=MTLStoreActionStore;
@@ -677,6 +678,7 @@ template<bool Diagnostics> Receipt FrameAdapter::SubmitFrameImpl(const std::shar
     if(fi_scene_pass) {
       std::string depth_error;
       if(auto depth=impl_->View(pass.depth->view,depth_error))fi::EncodeMotion(frame,depth);
+      else fi::NoteNoDepth(THEFT4_FG_DEPTH_FORMAT);
     }
     impl_->host_source_override=nil;
   }

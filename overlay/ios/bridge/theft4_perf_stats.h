@@ -33,10 +33,15 @@ typedef struct theft4_perf_event {
 } theft4_perf_event;
 
 uint64_t theft4_perf_now_ns(void);
-// Capture control (main thread). Start returns the read cursor.
+// Capture control (main thread). Start returns the read cursor. Recording is
+// reference counted: Long Performance Capture, the auto benchmark and the
+// performance overlay each hold one reference; stop releases it. Nothing is
+// recorded (and no completion/presented handlers are attached) at zero.
 uint64_t theft4_perf_start(void);
 void theft4_perf_stop(void);
 bool theft4_perf_enabled(void);
+// Current write position, for an additional independent reader.
+uint64_t theft4_perf_cursor(void);
 // Producers.
 void theft4_perf_record(const theft4_perf_event* event);
 void theft4_perf_mark_submit_begin(void);   // render thread, start of frame submission
@@ -52,12 +57,76 @@ void theft4_perf_count_rendered(void);
 void theft4_perf_count_generated(void);
 uint64_t theft4_perf_rendered_total(void);
 uint64_t theft4_perf_generated_total(void);
+// Sum of GPU busy time (command buffer GPUEnd-GPUStart) of completed frames,
+// only accumulated while recording is enabled. Used for an ESTIMATED GPU
+// utilisation (busy / wall); overlapping buffers can push it above 100%.
+uint64_t theft4_perf_gpu_busy_ns(void);
+void theft4_perf_add_gpu_busy(uint64_t ns);
 
+// ---- Runtime-switchable options (Theft4-MetalFX pass 3) ----
+// Set by the app at launch and by the governor / auto benchmark during play;
+// read by the renderer once per frame with relaxed atomics (no locks).
+// Frame generation: 0 off, 1 MetalFX frame interpolation, 2 FSR3 Lite.
+void theft4_opt_set_fg_mode(int mode);
+int theft4_opt_fg_mode(void);
+// Visual enhancement pass (CAS + mild curve).
+void theft4_opt_set_enhance(int on);
+int theft4_opt_enhance(void);
+// Presentation frame cap in fps (0 = uncapped). Implemented with
+// presentDrawable:afterMinimumDuration: (no sleeping or spinning).
+void theft4_opt_set_frame_cap(int fps);
+int theft4_opt_frame_cap(void);
+// Ask renderer-side caches owned by this overlay (frame generation history,
+// enhancement/upscale targets) to release memory at the next frame.
+void theft4_opt_request_trim(void);
+uint64_t theft4_opt_trim_generation(void);
+
+// ---- What the renderer actually did (published once per change) ----
+typedef struct theft4_render_info {
+  uint32_t present_source_w, present_source_h;   // image fed to the final present
+  uint32_t output_w, output_h;                   // present destination (drawable)
+  uint32_t scaler;        // 0 none (1:1), 1 MetalFX spatial, 2 bicubic fallback, 3 present downscale
+  uint32_t scaler_in_w, scaler_in_h, scaler_out_w, scaler_out_h;
+  uint32_t source_format; // MTLPixelFormat of the present source
+  uint32_t drawable_format;
+  int32_t fg_reason;      // THEFT4_FG_* below
+  int32_t fg_active_mode; // mode actually generating (0 none, 1 MetalFX, 2 FSR3 Lite)
+} theft4_render_info;
+void theft4_render_info_get(theft4_render_info* out);
+void theft4_render_info_set_present(uint32_t sw, uint32_t sh, uint32_t dw, uint32_t dh, uint32_t source_format);
+void theft4_render_info_set_scaler(uint32_t scaler, uint32_t iw, uint32_t ih, uint32_t ow, uint32_t oh);
+void theft4_render_info_set_drawable_format(uint32_t format);
+void theft4_render_info_set_fg(int reason, int active_mode);
+
+// Frame generation reason codes (overlay + logs). 1 = generating.
+enum {
+  THEFT4_FG_OFF = 0,
+  THEFT4_FG_GENERATING = 1,
+  THEFT4_FG_UNSUPPORTED_DEVICE = -1,   // MTLFXFrameInterpolatorDescriptor supportsDevice: NO
+  THEFT4_FG_DESCRIPTOR_FAILED = -2,    // newFrameInterpolatorWithDevice: returned nil
+  THEFT4_FG_SHADER_FAILED = -3,        // helper/FSR3 Lite pipelines failed to build
+  THEFT4_FG_NO_PREV_FRAME = -4,        // first frame after (re)start: nothing to interpolate from
+  THEFT4_FG_NO_DEPTH = -5,             // no single scene pass with a depth attachment this frame
+  THEFT4_FG_DEPTH_FORMAT = -6,         // scene depth format/usage cannot be sampled
+  THEFT4_FG_NO_CAMERA = -7,            // camera matrices invalid (MetalFX path uses optical flow instead)
+  THEFT4_FG_NO_DRAWABLE = -8,          // nextDrawable timed out for the generated frame
+  THEFT4_FG_TEXTURE_FAILED = -9,       // history/output texture allocation failed
+  THEFT4_FG_ENCODE_FAILED = -10,       // command buffer / encoder unavailable
+  THEFT4_FG_THERMAL_PAUSED = -11,      // governor paused it (serious/critical thermal)
+  THEFT4_FG_NOT_IN_GAME = -12          // no presented game frames yet
+};
+const char* theft4_fg_reason_text(int reason);
+
+// Camera notes from the title frontend (valid view-projection this frame).
+uint64_t theft4_camera_valid_frames(void);
+uint64_t theft4_camera_frames(void);
 // City density state (theft4_motion_blur.cpp): configured scales, state
 // (0 pending, 1 active, -1 disabled or stock) and the last value written into
 // each guest multiplier (random cars, parked cars, peds, scenario cur/next),
 // -1 when not written yet.
 int theft4_city_density_snapshot(double* traffic, double* peds, float* values5);
+// Runtime density change (percent 1..100), used by the governor and benchmark.
+void theft4_city_density_set(int traffic_percent, int ped_percent);
 
 #ifdef __cplusplus
 }
